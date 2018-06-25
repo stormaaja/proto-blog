@@ -5,9 +5,9 @@
             [ring.util.response :refer [redirect]]
             [clojure.string :refer [join split]]
             [proto-site.middlewares :refer [wrap-base]]
-            [proto-site.db :as db]
             [proto-site.layout :as html]
-            [proto-site.utils :as util :refer [defhandler]])
+            [proto-site.utils :as util :refer [defhandler]]
+            [clj-wiite.core :as w])
   (:import java.util.Date))
 
 (def req-deb (atom []))
@@ -17,27 +17,27 @@
 (def last-insert-rowid
   (keyword "last_insert_rowid()"))
 
-(defn id->post&tags [id]
-  (let [post-tags (db/id->post&tags db/db2 id)
-        tags (map :tag post-tags)
-        post (dissoc (first post-tags) :tag)]
-    (assoc post :tags tags)))
+(defn create-watom []
+  (let [state (w/watom "postgres://wiiteuser:passu@127.0.0.1:5432/wiitetest")]
+    (when (nil? @state)
+      (reset! state []))
+    state))
 
-(defn assoc-tags [post]
-  (assoc post
-         :tags
-         (map :tag (db/post-id->tags db/db2 (:id post)))))
+(defonce posts (create-watom))
+
+(defn id->post&tags [id]
+  (some #(when (= (:id %) id) %) @posts))
 
 (defn posts-range [n offset]
-  (->> (db/posts-range db/db2 n offset)
-       (map assoc-tags)
-       doall))
+  (if (> (+ n offset) (count @posts))
+    (subvec @posts offset)
+   (subvec @posts n (+ n offset))))
 
 ;; First page is no."1"
 (defhandler posts-in-page [p :as-int flash]
   (let [p (or p 1)
         targets (posts-range posts-per-page (* (dec p) posts-per-page))
-        n-posts (db/count-posts* db/db2)
+        n-posts (count @posts)
         max-page (inc (quot n-posts posts-per-page))]
     (html/blog-list targets p max-page flash)))
 
@@ -48,15 +48,15 @@
 (defn split-tags [tags-str]
   (distinct (split tags-str #"\s")))
 
-(defn register-tags! [post-id tags]
-  (doseq [tag (split-tags tags)]
-    (db/assoc-tag! db/db2 tag post-id)))
-
 (defn save-new-post! [title content tags]
   (let [now-epoc (util/now->epoc)]
-    (-> (db/save-post<! db/db2 title now-epoc content)
-        last-insert-rowid ;; TODO: research the key and replace this ugly ugly..
-        (register-tags! tags))
+    (swap! posts conj {:id (if (empty? @posts)
+                             1
+                             (apply max (map :id @posts)))
+                       :title title
+                       :created-at now-epoc
+                       :content content
+                       :tags (split-tags tags)})
     (println "New post arrived!")
     (util/redirect-with-flash "/" {:message "Posted new article!"})))
 
@@ -85,67 +85,67 @@
 (defhandler delete-post! [id :as-int auth]
   (if (and auth id)
     (do
-      (db/delete-post! db/db2 id)
-      (db/delete-post-tags! db/db2 id)
+      (reset! posts (filterv #(not= (:id %) id) @posts))
       (println "Deleted:" id)
       (util/redirect-with-flash "/" {:message (str "Deleted post:" id)}))
     (util/redirect-with-flash (str "/del?id=" id)
-                               
                               {:error "Wrong password!!"})))
 
 (defhandler edit-post-form [id :as-int flash]
-  (let [the-post (id->post&tags id)] 
+  (let [the-post (id->post&tags id)]
     (html/edit-post (anti-forgery-field) the-post (:error flash))))
 
+(defn find-index-of [f coll]
+  (when-let [item (first
+                    (filter #(f (second %)) (map-indexed vector coll)))]
+    (first item)))
+
 (defhandler update-post! [id :as-int title content tags auth] ;; TODO: Need refactoring
-  (if-let [errors (seq (validate-new-post title content tags auth))] 
+  (if-let [errors (seq (validate-new-post title content tags auth))]
     (util/redirect-with-flash (str "/edit?id=" id) ;; send back to edit-post-form
                               {:error (str "ERROR:" (join "/" errors))})
-    (let [new-tags (split-tags tags)
-          old-tags (map :tag (db/post-id->tags db/db2 id))
-          {:keys [pop drop]} (util/update-diff old-tags new-tags)]
-      (doseq [add-tag pop]
-        (db/assoc-tag! db/db2 add-tag id))
-      (when-let [ds (seq drop)]
-        (db/dissoc-tags! db/db2 id ds))
-      (db/edit-post! db/db2 title (util/now->epoc) content id)
+    (let [post (id->post&tags id)
+          index (find-index-of #(= (:id %) id) @posts)
+          new-tags (split-tags tags)]
+      (swap! posts assoc-in [index :tags] new-tags)
+      (swap! posts assoc-in [index :date] (util/now->epoc))
       (util/redirect-with-flash "/"
                                 {:message (str "Updated post! id:" id)}))))
 
-(defn search-by [db-query qstr]
-  (if qstr
-    (let [posts (map assoc-tags (db-query db/db2 (str "%" qstr "%")))]
-      (html/search-result posts qstr))
-    "Give me some text you want to search."))
+(defn search-by [f]
+  (let [result (filter #(f %) @posts)]
+      (html/search-result result "")))
 
 
 (defhandler search-by-date [year :as-int month :as-int date :as-int]
   (if (and date (not month))
     "TODO: ERROR"
     (let [[from til] (util/date-range year month date)
-          posts (db/date-between db/db2 from til)]
-      (html/search-result posts (str "Posted at " year 
-                                     (when month "-" month) 
+          posts (filter #(and (>= (:date %) from) (<= (:til %) til)))]
+      (html/search-result posts (str "Posted at " year
+                                     (when month "-" month)
                                      (when date "-" date))))))
 
 (defroutes app-routes
   (GET "/" [p :as {flash :flash}] (posts-in-page p flash))
-  (GET "/article/:id" [id] (html/blog-post (db/find-post-by-id db/db2 id)))
+  (GET "/article/:id" [id] (html/blog-post (id->post&tags id)))
   (GET "/new" {flash :flash} (new-post-form flash))
   (POST "/new" [title content tags auth] (handle-new-post title content tags auth))
-  (GET "/del" [id :as {flash :flash}] (html/blog-delete (anti-forgery-field) 
+  (GET "/del" [id :as {flash :flash}] (html/blog-delete (anti-forgery-field)
                                              (merge flash
-                                                    (db/find-post-by-id db/db2 id))))
+                                                    (id->post&tags id))))
   (DELETE "/del" [id auth] (delete-post! id auth))
   (GET "/edit" [id :as {flash :flash}] (edit-post-form id flash))
   (PUT "/edit" [id title content tags auth] (update-post! id title content tags auth))
   (GET "/search/date" [year month date] (search-by-date year month date))
-  (GET "/search/text" [q] (search-by db/search-text q))
-  (GET "/search/tag" [q] (search-by db/search-by-tag q))
+  (GET "/search/text" [q] (search-by
+                            #(or (.contains (:title %) q)
+                                 (.contains (:content %)))))
+  (GET "/search/tag" [q] (search-by
+                            #(some (fn [x] (when (= x q) true)) (:tags %))))
   (ANY "/debug/echo" req (pr-str (swap! req-deb conj req)))
   (route/not-found "Not Found")
   (route/resources "/"))
 
 (def app
   (wrap-base app-routes))
-
